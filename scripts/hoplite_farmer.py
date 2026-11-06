@@ -3,63 +3,57 @@ import random
 import string
 import re
 import httpx
-from playwright.async_api import async_playwright
 import os
+from playwright.async_api import async_playwright
 
 # --- KONFIGURASI ---
-PROMO_CODE = "CLOUDFIRST"
+PROMO_CODE = os.getenv("HOPLITE_PROMO", "CLOUDFIRST")
 BASE_URL = "https://app.hoplite.sh"
 
-# --- FUNGSI EMAIL SEMENTARA (Mail.tm) ---
 async def create_temp_email():
     async with httpx.AsyncClient() as client:
         r = await client.get("https://api.mail.tm/domains")
         domain = r.json()['hydra:member'][0]['domain']
-        
-        local_part = ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
+        local_part = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
         address = f"{local_part}@{domain}"
         password = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
         
         await client.post("https://api.mail.tm/accounts", json={"address": address, "password": password})
         r = await client.post("https://api.mail.tm/token", json={"address": address, "password": password})
-        token = r.json()['token']
-        
-        return address, token
+        return address, r.json()['token']
 
-async def fetch_otp_or_link(token, timeout=120):
+async def fetch_verification(token, timeout=120):
     async with httpx.AsyncClient() as client:
         start_time = asyncio.get_event_loop().time()
         while asyncio.get_event_loop().time() - start_time < timeout:
-            r = await client.get("https://api.mail.tm/messages", headers={"Authorization": f"Bearer {token}"})
-            messages = r.json()['hydra:member']
-            if messages:
-                msg_id = messages[0]['id']
-                msg_detail = await client.get(f"https://api.mail.tm/messages/{msg_id}", headers={"Authorization": f"Bearer {token}"})
-                text_content = msg_detail.json()['text']
-                
-                # Cek apakah ada link verifikasi
-                link_match = re.search(r'https?://[^\s]+', text_content)
-                if link_match:
-                    return "link", link_match.group(0)
-                
-                # Cek apakah ada kode OTP (6 digit)
-                otp_match = re.search(r'\b(\d{6})\b', text_content)
-                if otp_match:
-                    return "otp", otp_match.group(1)
-            await asyncio.sleep(5)
-        raise TimeoutError("Verifikasi tidak ditemukan dalam batas waktu")
+            try:
+                r = await client.get("https://api.mail.tm/messages", headers={"Authorization": f"Bearer {token}"})
+                messages = r.json()['hydra:member']
+                if messages:
+                    msg_id = messages[0]['id']
+                    msg_detail = await client.get(f"https://api.mail.tm/messages/{msg_id}", headers={"Authorization": f"Bearer {token}"})
+                    html_content = " ".join(msg_detail.json().get('html', []))
+                    text_content = msg_detail.json().get('text', '')
+                    
+                    # Cari Link Verifikasi
+                    link_match = re.search(r'https?://[^\s"\'<>]+', html_content + text_content)
+                    if link_match:
+                        return link_match.group(0)
+            except Exception:
+                pass
+            await asyncio.sleep(4)
+        raise TimeoutError("Email verifikasi tidak kunjung datang.")
 
-# --- FUNGSI UTAMA FARMING ---
-async def farm_hoplite_account():
+async def farm_hoplite():
     email_address, email_token = await create_temp_email()
     print(f"[*] Memproses akun: {email_address}")
     
     async with async_playwright() as p:
-        # Gunakan proxy jika ada di environment variable
         proxy_url = os.getenv("PROXY_URL")
         browser = await p.chromium.launch(
             headless=True,
-            proxy={"server": proxy_url} if proxy_url else None
+            proxy={"server": proxy_url} if proxy_url else None,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
         )
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -67,53 +61,46 @@ async def farm_hoplite_account():
         page = await context.new_page()
         
         try:
-            # 1. Buka halaman signup
-            await page.goto(f"{BASE_URL}/signup", wait_until="networkidle")
+            # 1. Buka Signup
+            await page.goto(f"{BASE_URL}/signup", wait_until="domcontentloaded")
+            await page.wait_for_timeout(3000)
             
-            # 2. Isi email (selector mungkin perlu disesuaikan)
+            # 2. Isi Email
             await page.fill('input[type="email"]', email_address)
-            await page.click('button[type="submit"]')
+            # Klik Continue/Sign up
+            await page.locator('button[type="submit"], button:has-text("Continue"), button:has-text("Sign up")').first.click()
             
-            # 3. Tunggu verifikasi email
-            print(f"[*] Menunggu verifikasi untuk {email_address}...")
-            v_type, v_data = await fetch_otp_or_link(email_token)
+            print(f"[*] Menunggu link verifikasi di email...")
+            verify_url = await fetch_verification(email_token)
             
-            if v_type == "link":
-                await page.goto(v_data, wait_until="networkidle")
-            elif v_type == "otp":
-                await page.fill('input[type="text"]', v_data)
-                await page.click('button[type="submit"]')
+            # 3. Buka Link Verifikasi
+            await page.goto(verify_url, wait_until="domcontentloaded")
+            await page.wait_for_timeout(5000)
+            print("[+] Email berhasil diverifikasi.")
             
-            # 4. Tunggu masuk ke dashboard
-            await page.wait_for_url(f"{BASE_URL}/**", timeout=30000)
-            print("[+] Berhasil masuk dashboard.")
+            # 4. Masuk ke Billing
+            await page.goto(f"{BASE_URL}/settings/billing", wait_until="domcontentloaded")
+            await page.wait_for_timeout(3000)
             
-            # 5. Buka Settings > Billing
-            await page.goto(f"{BASE_URL}/settings/billing", wait_until="networkidle")
+            # 5. Input Promo Code
+            print(f"[*] Mencoba memasukkan kode promo: {PROMO_CODE}")
+            promo_input = page.locator('input[placeholder*="code" i], input[placeholder*="promo" i], input[name*="coupon" i], input[name*="promo" i]').first
+            await promo_input.fill(PROMO_CODE)
+            await page.wait_for_timeout(1000)
             
-            # 6. Masukkan kode promo
-            try:
-                # Cari input untuk kode promo
-                promo_input = await page.wait_for_selector('input[placeholder*="code" i], input[name*="promo" i], input[name*="coupon" i]', timeout=10000)
-                await promo_input.fill(PROMO_CODE)
-                
-                # Klik tombol Redeem/Apply
-                await page.click('button:has-text("Redeem"), button:has-text("Apply")')
-                await page.wait_for_timeout(5000) # Tunggu proses
-                print("[+] Kode promo berhasil dimasukkan!")
-            except Exception as e:
-                print(f"[-] Gagal memasukkan kode promo: {e}")
-                # Screenshot untuk diagnosa
-                await page.screenshot(path=f"/tmp/hoplite_billing_{email_address}.png")
+            # Klik Redeem/Apply
+            await page.locator('button:has-text("Redeem"), button:has-text("Apply"), button:has-text("Submit")').first.click()
+            await page.wait_for_timeout(5000)
             
+            print(f"[+] Sukses! Cek dashboard untuk status plan.")
             return {"email": email_address, "status": "success"}
             
         except Exception as e:
-            print(f"[-] Gagal memproses {email_address}: {e}")
             await page.screenshot(path=f"/tmp/hoplite_fail_{email_address}.png")
+            print(f"[-] Gagal: {e}")
             return {"email": email_address, "status": "failed", "error": str(e)}
         finally:
             await browser.close()
 
 if __name__ == "__main__":
-    asyncio.run(farm_hoplite_account())
+    asyncio.run(farm_hoplite())
